@@ -5,12 +5,13 @@ from datetime import datetime, timedelta
 import re
 
 REED_SEARCH_URL = "https://www.reed.co.uk/jobs"
+ADZUNA_SEARCH_URL = "https://www.adzuna.co.uk/jobs/search"
 
 COMPANY_BLACKLIST = {
     "Robert Half",
 }
 
-HEADERS = {
+REED_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -18,14 +19,29 @@ HEADERS = {
     )
 }
 
+# Adzuna requires Sec-Fetch headers or it returns 403/Too Many Requests
+ADZUNA_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
 
-def get_jobs(keywords, location="", distance=50, pages=1, wfh=False, job_type="perm"):
-    """
-    job_type: "perm", "contract", or "both"
-    wfh: True to filter for work-from-home roles only
-    """
+
+# ---------------------------------------------------------------------------
+# Reed
+# ---------------------------------------------------------------------------
+
+def _fetch_reed(keywords, location="", distance=50, pages=1, wfh=False, job_type="perm"):
     types = ["perm", "contract"] if job_type == "both" else [job_type]
-    all_jobs = []
+    jobs = []
     seen_urls = set()
     for jtype in types:
         for page in range(1, pages + 1):
@@ -34,23 +50,23 @@ def get_jobs(keywords, location="", distance=50, pages=1, wfh=False, job_type="p
                 "location": location,
                 "proximity": distance,
                 "pageno": page,
+                jtype: "true",
             }
-            params[jtype] = "true"
             if wfh:
                 params["wfh"] = "true"
-            response = requests.get(REED_SEARCH_URL, params=params, headers=HEADERS)
+            response = requests.get(REED_SEARCH_URL, params=params, headers=REED_HEADERS)
             response.raise_for_status()
-            page_jobs = parse_jobs(response.text)
+            page_jobs = _parse_reed(response.text)
             if not page_jobs:
                 break
             for job in page_jobs:
                 if job["url"] not in seen_urls:
                     seen_urls.add(job["url"])
-                    all_jobs.append(job)
-    return all_jobs
+                    jobs.append(job)
+    return jobs
 
 
-def parse_jobs(html):
+def _parse_reed(html):
     soup = BeautifulSoup(html, "html.parser")
     jobs = []
     for card in soup.select("article[data-qa='job-card']"):
@@ -61,12 +77,11 @@ def parse_jobs(html):
         salary_el = card.select_one("li[data-qa='job-metadata-salary']")
         job_type_svg = card.select_one("li svg[aria-label='Clock']")
         job_type_el = job_type_svg.parent if job_type_svg else None
-        wfh = any(
+        is_wfh = any(
             "Work from home" in li.get_text()
             for li in card.select("ul[data-qa='job-metadata'] li")
         )
 
-        # Date is the text in the posted-by div before " by Company"
         date_posted = ""
         if posted_by_el:
             raw = posted_by_el.get_text(" ", strip=True)
@@ -81,15 +96,130 @@ def parse_jobs(html):
             "location": location_el.get_text(strip=True) if location_el else "",
             "salary": salary_el.get_text(strip=True) if salary_el else "",
             "job_type": job_type_el.get_text(strip=True) if job_type_el else "",
-            "work_from_home": wfh,
+            "work_from_home": is_wfh,
             "date_posted": date_posted,
+            "source": "Reed",
             "url": url,
         })
     return jobs
 
 
+# ---------------------------------------------------------------------------
+# Adzuna
+# ---------------------------------------------------------------------------
+
+def _adzuna_location(location):
+    """Adzuna rejects full UK postcodes (e.g. 'RG7 1SS'). Strip to the outward code ('RG7')."""
+    if re.match(r'^[A-Z]{1,2}\d{1,2}[A-Z]?\s+\d[A-Z]{2}$', location.strip(), re.IGNORECASE):
+        return location.strip().split()[0]
+    return location
+
+
+def _fetch_adzuna(keywords, location="", distance=50, pages=1, wfh=False, job_type="perm"):
+    jobs = []
+    seen_urls = set()
+    types = ["perm", "contract"] if job_type == "both" else [job_type]
+    adzuna_location = _adzuna_location(location)
+
+    for jtype in types:
+        for page in range(1, pages + 1):
+            params = {
+                "q": keywords,
+                "w": adzuna_location,
+                "r": distance,
+                "sort": "date",
+                "p": page,
+            }
+            if jtype == "perm":
+                params["perm"] = 1
+            elif jtype == "contract":
+                params["contract"] = 1
+            if wfh:
+                params["q"] = f"{keywords} remote"
+
+            response = requests.get(ADZUNA_SEARCH_URL, params=params, headers=ADZUNA_HEADERS)
+            response.raise_for_status()
+            page_jobs = _parse_adzuna(response.text)
+            if not page_jobs:
+                break
+            for job in page_jobs:
+                if job["url"] not in seen_urls:
+                    seen_urls.add(job["url"])
+                    jobs.append(job)
+    return jobs
+
+
+def _parse_adzuna(html):
+    soup = BeautifulSoup(html, "html.parser")
+    jobs = []
+    for card in soup.select("article[data-aid]"):
+        title_el = card.select_one("h2 a[data-js='jobLink']")
+        company_el = card.select_one("div.ui-company")
+        location_el = card.select_one("div.ui-location")
+        salary_el = card.select_one("div.ui-salary")
+
+        title = " ".join(title_el.get_text(" ", strip=True).split()) if title_el else ""
+        company = company_el.get("data-company-name") or (company_el.get_text(strip=True) if company_el else "")
+        location = location_el.get_text(strip=True) if location_el else ""
+
+        # Salary: if it's a JOBSWORTH estimate rather than a real figure, discard it
+        salary = ""
+        if salary_el:
+            raw_salary = salary_el.get_text(" ", strip=True)
+            if "JOBSWORTH" not in raw_salary.upper():
+                salary = re.sub(r'\s*\b(TOP MATCH|CLOSING SOON|NEW)\b.*', '', raw_salary, flags=re.IGNORECASE).strip()
+
+        href = title_el.get("href", "") if title_el else ""
+        url = "https://www.adzuna.co.uk" + href if href.startswith("/") else href
+
+        snippet = card.get_text(" ", strip=True).lower()
+        is_wfh = any(kw in snippet for kw in ("remote", "work from home", "wfh"))
+
+        jobs.append({
+            "title": title,
+            "company": company,
+            "location": location,
+            "salary": salary,
+            "job_type": "",   # not shown on Adzuna listing cards
+            "work_from_home": is_wfh,
+            "date_posted": "",  # not shown on Adzuna listing cards
+            "source": "Adzuna",
+            "url": url,
+        })
+    return jobs
+
+
+# ---------------------------------------------------------------------------
+# Shared
+# ---------------------------------------------------------------------------
+
+def get_jobs(keywords, location="", distance=50, pages=1, wfh=False, job_type="perm",
+             sources=("reed", "adzuna")):
+    """
+    sources: tuple of "reed" and/or "adzuna"
+    job_type: "perm", "contract", or "both"
+    wfh: True to include work-from-home roles only
+    """
+    all_jobs = []
+    seen_urls = set()
+
+    fetchers = {"reed": _fetch_reed, "adzuna": _fetch_adzuna}
+    for source in sources:
+        fetch = fetchers.get(source)
+        if not fetch:
+            print(f"Unknown source: {source!r}")
+            continue
+        for job in fetch(keywords, location, distance=distance, pages=pages,
+                         wfh=wfh, job_type=job_type):
+            if job["url"] not in seen_urls:
+                seen_urls.add(job["url"])
+                all_jobs.append(job)
+
+    return all_jobs
+
+
 def _parse_date(date_str):
-    """Convert Reed date strings to a datetime for sorting purposes."""
+    """Convert date strings from any source to a datetime for sorting."""
     now = datetime.now()
     s = date_str.strip().lower()
     if not s:
@@ -149,9 +279,17 @@ if __name__ == "__main__":
     job_type = job_type_input if job_type_input in ("perm", "contract", "both") else "perm"
     wfh_input = input("Work from home only? y/n [n]: ").strip().lower()
     wfh = wfh_input == "y"
+    sources_input = input("Sources — reed, adzuna, or both [both]: ").strip().lower()
+    if sources_input == "reed":
+        sources = ("reed",)
+    elif sources_input == "adzuna":
+        sources = ("adzuna",)
+    else:
+        sources = ("reed", "adzuna")
 
-    jobs = get_jobs(keywords, location, distance=distance, pages=pages, wfh=wfh, job_type=job_type)
+    jobs = get_jobs(keywords, location, distance=distance, pages=pages,
+                    wfh=wfh, job_type=job_type, sources=sources)
     if jobs:
         save_jobs(sort_jobs_by_date(filter_blacklisted(jobs)))
     else:
-        print("No jobs found. The page structure may have changed — check the CSS selectors in parse_jobs().")
+        print("No jobs found.")
