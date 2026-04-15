@@ -11,6 +11,21 @@ COMPANY_BLACKLIST = {
     "Robert Half",
 }
 
+SC_PATTERN = re.compile(
+    r'\bsc\s*clear(?:ed|ance)?\b'
+    r'|\bsc\s*required\b'
+    r'|\bsecurity\s+clear(?:ed|ance)\b'
+    r'|\bneed.*\bsc\b'
+    r'|\brequire.*\bsc\b',
+    re.IGNORECASE,
+)
+
+
+def _check_sc(text):
+    """Return True if text suggests SC (Security Check) clearance is required."""
+    return bool(SC_PATTERN.search(text))
+
+
 REED_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -55,6 +70,8 @@ def _fetch_reed(keywords, location="", distance=50, pages=1, wfh=False, job_type
             if wfh:
                 params["wfh"] = "true"
             response = requests.get(REED_SEARCH_URL, params=params, headers=REED_HEADERS)
+            if response.status_code == 404:
+                break
             response.raise_for_status()
             page_jobs = _parse_reed(response.text)
             if not page_jobs:
@@ -90,6 +107,7 @@ def _parse_reed(html):
         href = title_el.get("href", "") if title_el else ""
         url = "https://www.reed.co.uk" + href if href.startswith("/") else href
 
+        card_text = card.get_text(" ", strip=True)
         jobs.append({
             "title": title_el.get_text(strip=True) if title_el else "",
             "company": company_el.get_text(strip=True) if company_el else "",
@@ -100,6 +118,7 @@ def _parse_reed(html):
             "date_posted": date_posted,
             "source": "Reed",
             "url": url,
+            "SC": _check_sc(card_text),
         })
     return jobs
 
@@ -185,6 +204,7 @@ def _parse_adzuna(html):
             "date_posted": "",  # not shown on Adzuna listing cards
             "source": "Adzuna",
             "url": url,
+            "SC": _check_sc(snippet),
         })
     return jobs
 
@@ -214,6 +234,10 @@ def get_jobs(keywords, location="", distance=50, pages=1, wfh=False, job_type="p
             if job["url"] not in seen_urls:
                 seen_urls.add(job["url"])
                 all_jobs.append(job)
+
+    # Server-side WFH filters are unreliable; enforce client-side
+    if wfh:
+        all_jobs = [j for j in all_jobs if j.get("work_from_home")]
 
     return all_jobs
 
